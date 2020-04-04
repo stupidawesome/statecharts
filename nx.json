@@ -25,6 +25,9 @@
     "statecharts-dev-e2e": {
       "tags": [],
       "implicitDependencies": ["statecharts-dev"]
+    },
+    "core": {
+      "tags": []
     }
   }
 }
