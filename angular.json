@@ -1,0 +1,138 @@
+{
+  "version": 1,
+  "projects": {
+    "statecharts-dev": {
+      "projectType": "application",
+      "schematics": {},
+      "root": "apps/statecharts-dev",
+      "sourceRoot": "apps/statecharts-dev/src",
+      "prefix": "statecharts",
+      "architect": {
+        "build": {
+          "builder": "@angular-devkit/build-angular:browser",
+          "options": {
+            "outputPath": "dist/apps/statecharts-dev",
+            "index": "apps/statecharts-dev/src/index.html",
+            "main": "apps/statecharts-dev/src/main.ts",
+            "polyfills": "apps/statecharts-dev/src/polyfills.ts",
+            "tsConfig": "apps/statecharts-dev/tsconfig.app.json",
+            "aot": true,
+            "assets": [
+              "apps/statecharts-dev/src/favicon.ico",
+              "apps/statecharts-dev/src/assets"
+            ],
+            "styles": ["apps/statecharts-dev/src/styles.css"],
+            "scripts": []
+          },
+          "configurations": {
+            "production": {
+              "fileReplacements": [
+                {
+                  "replace": "apps/statecharts-dev/src/environments/environment.ts",
+                  "with": "apps/statecharts-dev/src/environments/environment.prod.ts"
+                }
+              ],
+              "optimization": true,
+              "outputHashing": "all",
+              "sourceMap": false,
+              "extractCss": true,
+              "namedChunks": false,
+              "extractLicenses": true,
+              "vendorChunk": false,
+              "buildOptimizer": true,
+              "budgets": [
+                {
+                  "type": "initial",
+                  "maximumWarning": "2mb",
+                  "maximumError": "5mb"
+                },
+                {
+                  "type": "anyComponentStyle",
+                  "maximumWarning": "6kb",
+                  "maximumError": "10kb"
+                }
+              ]
+            }
+          }
+        },
+        "serve": {
+          "builder": "@angular-devkit/build-angular:dev-server",
+          "options": {
+            "browserTarget": "statecharts-dev:build"
+          },
+          "configurations": {
+            "production": {
+              "browserTarget": "statecharts-dev:build:production"
+            }
+          }
+        },
+        "extract-i18n": {
+          "builder": "@angular-devkit/build-angular:extract-i18n",
+          "options": {
+            "browserTarget": "statecharts-dev:build"
+          }
+        },
+        "lint": {
+          "builder": "@angular-devkit/build-angular:tslint",
+          "options": {
+            "tsConfig": [
+              "apps/statecharts-dev/tsconfig.app.json",
+              "apps/statecharts-dev/tsconfig.spec.json"
+            ],
+            "exclude": ["**/node_modules/**", "!apps/statecharts-dev/**"]
+          }
+        },
+        "test": {
+          "builder": "@nrwl/jest:jest",
+          "options": {
+            "jestConfig": "apps/statecharts-dev/jest.config.js",
+            "tsConfig": "apps/statecharts-dev/tsconfig.spec.json",
+            "passWithNoTests": true,
+            "setupFile": "apps/statecharts-dev/src/test-setup.ts"
+          }
+        }
+      }
+    },
+    "statecharts-dev-e2e": {
+      "root": "apps/statecharts-dev-e2e",
+      "sourceRoot": "apps/statecharts-dev-e2e/src",
+      "projectType": "application",
+      "architect": {
+        "e2e": {
+          "builder": "@nrwl/cypress:cypress",
+          "options": {
+            "cypressConfig": "apps/statecharts-dev-e2e/cypress.json",
+            "tsConfig": "apps/statecharts-dev-e2e/tsconfig.e2e.json",
+            "devServerTarget": "statecharts-dev:serve"
+          },
+          "configurations": {
+            "production": {
+              "devServerTarget": "statecharts-dev:serve:production"
+            }
+          }
+        },
+        "lint": {
+          "builder": "@angular-devkit/build-angular:tslint",
+          "options": {
+            "tsConfig": ["apps/statecharts-dev-e2e/tsconfig.e2e.json"],
+            "exclude": ["**/node_modules/**", "!apps/statecharts-dev-e2e/**"]
+          }
+        }
+      }
+    }
+  },
+  "cli": {
+    "defaultCollection": "@nrwl/angular",
+    "analytics": false
+  },
+  "schematics": {
+    "@nrwl/angular:application": {
+      "unitTestRunner": "jest",
+      "e2eTestRunner": "cypress"
+    },
+    "@nrwl/angular:library": {
+      "unitTestRunner": "jest"
+    }
+  },
+  "defaultProject": "statecharts-dev"
+}
