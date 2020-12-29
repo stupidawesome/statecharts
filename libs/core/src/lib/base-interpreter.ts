@@ -1,173 +1,67 @@
-import {
-    DataModel,
-    HistoryValue,
-    InvokeRef,
-    StateRef,
-    TransitionRef,
-} from "./models"
-import { HistoryContent, ScxmlEvent, ScxmlSchema } from "./schemas"
+import { InvokeNode, StateDocument, StateNode, TransitionNode } from "./interfaces"
 import {
     BlockingQueue,
-    conditionMatch,
-    documentOrder,
-    entryOrder,
-    exitOrder,
-    getChildStates,
-    getProperAncestors,
-    isAtomicState,
-    isCancelEvent,
-    isCompoundState,
-    isCompoundStateOrScxmlElement,
-    isDescendant,
-    isFinalState,
-    isHistoryState,
-    isParallelState,
-    isSCXMLElement,
-    nameMatch,
-    OrderedSet,
-    Queue,
+    conditionMatch, documentOrder,
+    entryOrder, exitOrder,
+    getChildStates, getProperAncestors,
+    HashTable, hasLegalCompletion,
+    isAtomicState, isCancelEvent, isCompoundState, isCompoundStateOrScxmlElement, isDescendant,
+    isFinalState, isHistoryState,
+    isParallelState, isSCXMLElement,
+    List, nameMatch, OrderedSet, Queue,
 } from "./utils"
-import { schemaToModel } from "./schema-to-model"
 
-export abstract class BaseInterpreter<T extends { [key: string]: any } = any> {
-    running = false
-    historyValue: HistoryValue = {}
-    configuration = new OrderedSet<StateRef>()
-    statesToInvoke = new OrderedSet<StateRef>()
-    internalQueue = new Queue()
-    externalQueue = new BlockingQueue()
-    context = {}
-    invokes: { [key: string]: any } = {}
-    datamodel: DataModel<T>
+export abstract class BaseInterpreter {
+    running: boolean
+    configuration: OrderedSet<StateNode>
+    statesToInvoke: OrderedSet<StateNode>
+    internalQueue: Queue
+    externalQueue: BlockingQueue
+    historyValue: HashTable<StateNode[]>
+    event: any
+    datamodel: any;
+    abstract id: string
     parent?: BaseInterpreter
-    binding: string
 
-    constructor(schema: ScxmlSchema<T>, parent?: BaseInterpreter) {
-        const doc = schemaToModel(schema)
-        this.parent = parent
-        this.running = true
-        this.binding = doc.binding
-        this.datamodel = doc.datamodel
-        if (this.binding === "early") {
-            this.datamodel.initialize()
+    enterStates(enabledTransitions: List<TransitionNode>) {
+        const statesToEnter = new OrderedSet<StateNode>()
+        const statesForDefaultEntry = new OrderedSet<StateNode>()
+        // initialize the temporary table for default content in history states
+        const defaultHistoryContent = new HashTable<StateNode[]>()
+
+        this.computeEntrySet(enabledTransitions, statesToEnter, statesForDefaultEntry, defaultHistoryContent)
+
+        // todo: check this statically
+        if (!hasLegalCompletion(statesToEnter.toList().list)) {
+            throw new Error("Invalid transition target")
         }
-        this.enterStates([doc.initial.transition])
-        void this.mainEventLoop()
-    }
 
-    isInFinalState(state: StateRef) {
-        const { configuration } = this
-        if (isCompoundState(state)) {
-            return getChildStates(state).some(
-                s => isFinalState(s) && configuration.has(s),
-            )
-        } else if (isParallelState(state)) {
-            return getChildStates(state).every(this.isInFinalState, this)
-        } else {
-            return false
-        }
-    }
-
-    addAncestorStatesToEnter(
-        state: StateRef,
-        parent: StateRef | null,
-        statesToEnter: OrderedSet<StateRef>,
-        statesForDefaultEntry: OrderedSet<StateRef>,
-        defaultHistoryContent: HistoryContent,
-    ) {
-        for (const anc of getProperAncestors(state, parent)) {
-            statesToEnter.add(anc)
-            if (isParallelState(anc)) {
-                for (const child of getChildStates(anc)) {
-                    if (!statesToEnter.some(s => isDescendant(s, child))) {
-                        this.addDescendantStatesToEnter(
-                            child,
-                            statesToEnter,
-                            statesForDefaultEntry,
-                            defaultHistoryContent,
-                        )
-                    }
-                }
+        for (const s of statesToEnter.toList().sort(entryOrder)) {
+            this.configuration.add(s)
+            this.statesToInvoke.add(s)
+            for (const content of s.onentry.sort(documentOrder)) {
+                this.executeContent(content)
             }
-        }
-    }
-
-    addDescendantStatesToEnter(
-        state: StateRef,
-        statesToEnter: OrderedSet<StateRef>,
-        statesForDefaultEntry: OrderedSet<StateRef>,
-        defaultHistoryContent: HistoryContent,
-    ) {
-        const { historyValue } = this
-        if (isHistoryState(state)) {
-            if (historyValue[state.id]) {
-                for (const s of historyValue[state.id]) {
-                    this.addDescendantStatesToEnter(
-                        s,
-                        statesToEnter,
-                        statesForDefaultEntry,
-                        defaultHistoryContent,
-                    )
-                    this.addAncestorStatesToEnter(
-                        s,
-                        state.parent,
-                        statesToEnter,
-                        statesForDefaultEntry,
-                        defaultHistoryContent,
-                    )
-                }
-            } else {
-                defaultHistoryContent[
-                    state.parent.id
-                ] = state.transitions.reduce((a, t) => a.concat(t.commands), [])
-
-                for (const s of state.transitions[0].target) {
-                    this.addDescendantStatesToEnter(
-                        s,
-                        statesToEnter,
-                        statesForDefaultEntry,
-                        defaultHistoryContent,
-                    )
-                    if (state.parent) {
-                        this.addAncestorStatesToEnter(
-                            s,
-                            state.parent,
-                            statesToEnter,
-                            statesForDefaultEntry,
-                            defaultHistoryContent,
-                        )
-                    }
-                }
+            if (statesForDefaultEntry.isMember(s)) {
+                // tslint:disable-next-line:no-non-null-assertion
+                this.executeContent(s.initial!.transition.content)
             }
-        } else {
-            statesToEnter.add(state)
-            if (isCompoundState(state)) {
-                statesForDefaultEntry.add(state)
-                for (const s of state.initial.transition.target) {
-                    this.addDescendantStatesToEnter(
-                        s,
-                        statesToEnter,
-                        statesForDefaultEntry,
-                        defaultHistoryContent,
-                    )
-                    this.addAncestorStatesToEnter(
-                        s,
-                        state,
-                        statesToEnter,
-                        statesForDefaultEntry,
-                        defaultHistoryContent,
-                    )
+            if (defaultHistoryContent[s.id]) {
+                this.executeContent(defaultHistoryContent[s.id])
+            }
+            if (isFinalState(s)) {
+                if (isSCXMLElement(s.parent)) {
+                    this.running = false
                 }
-            } else {
-                if (isParallelState(state)) {
-                    for (const child of getChildStates(state)) {
-                        if (!statesToEnter.some(s => isDescendant(s, child))) {
-                            this.addDescendantStatesToEnter(
-                                child,
-                                statesToEnter,
-                                statesForDefaultEntry,
-                                defaultHistoryContent,
-                            )
+                else {
+                    const parent = s.parent
+                    const grandparent = parent.parent
+
+                    this.internalQueue.enqueue(new Event("done.state." + parent.id, s.donedata))
+
+                    if (isParallelState(grandparent)) {
+                        if (getChildStates(grandparent).every(this.isInFinalState, this)) {
+                            this.internalQueue.enqueue(new Event("done.state." + grandparent.id))
                         }
                     }
                 }
@@ -175,103 +69,151 @@ export abstract class BaseInterpreter<T extends { [key: string]: any } = any> {
         }
     }
 
-    findLCCA(stateList: StateRef[]) {
-        for (const anc of getProperAncestors(stateList[0], null).filter(
-            isCompoundStateOrScxmlElement,
-        )) {
-            if (stateList.slice(1).every(s => isDescendant(s, anc))) {
-                return anc
-            }
-        }
-    }
+    async mainEventLoop() {
+        while (this.running) {
+            let enabledTransitions: OrderedSet<TransitionNode> | null = null
+            let macroStepDone = false
 
-    getTransitionDomain(t: TransitionRef) {
-        const tstates = this.getEffectiveTargetStates(t)
-        if (!tstates) {
-            return null
-        } else if (
-            t.source &&
-            t.type === "internal" &&
-            isCompoundState(t.source) &&
-            tstates.every(s => isDescendant(s, t.source))
-        ) {
-            return t.source
-        } else {
-            return this.findLCCA([t.source].concat(tstates.toList()))
-        }
-    }
-
-    computeEntrySet(
-        enabledTransitions: TransitionRef[],
-        statesToEnter: OrderedSet<StateRef>,
-        statesForDefaultEntry: OrderedSet<StateRef>,
-        defaultHistoryContent: HistoryContent,
-    ) {
-        for (const t of enabledTransitions) {
-            for (const s of t.target) {
-                this.addDescendantStatesToEnter(
-                    s,
-                    statesToEnter,
-                    statesForDefaultEntry,
-                    defaultHistoryContent,
-                )
-            }
-            const ancestor = this.getTransitionDomain(t)
-            for (const s of this.getEffectiveTargetStates(t)) {
-                this.addAncestorStatesToEnter(
-                    s,
-                    ancestor,
-                    statesToEnter,
-                    statesForDefaultEntry,
-                    defaultHistoryContent,
-                )
-            }
-        }
-    }
-
-    getEffectiveTargetStates(transition: TransitionRef) {
-        const { historyValue } = this
-        const targets = new OrderedSet<StateRef>()
-        for (const s of transition.target) {
-            if (isHistoryState(s)) {
-                if (historyValue[s.id]) {
-                    targets.union(historyValue[s.id])
-                } else {
-                    for (const t of s.transitions) {
-                        targets.union(this.getEffectiveTargetStates(t))
+            // Here we handle eventless transitions and transitions
+            // triggered by internal events until macrostep is complete
+            while (this.running && !macroStepDone) {
+                enabledTransitions = this.selectEventlessTransitions()
+                if (enabledTransitions.isEmpty()) {
+                    if (this.internalQueue.isEmpty()) {
+                        macroStepDone = true
+                    } else {
+                        const internalEvent = this.internalQueue.dequeue()
+                        this.event = internalEvent
+                        enabledTransitions = this.selectTransitions(internalEvent)
                     }
                 }
-            } else {
-                targets.add(s)
+                if (!enabledTransitions.isEmpty()) {
+                    this.microstep(enabledTransitions.toList())
+                }
+
+                // either we're in a final state, and we break out of the loop
+                if (!this.running) {
+                    break
+                }
+
+                // or we've completed a macrostep, so we start a new macrostep by waiting for an external event
+                // Here we invoke whatever needs to be invoked. The implementation of 'invoke' is platform-specific
+                for (const state of this.statesToInvoke.sort(documentOrder)) {
+                    for (const inv of state.invoke.sort(entryOrder)) {
+                        this.invoke(inv)
+                    }
+                }
+                this.statesToInvoke.clear()
+                // Invoking may have raised internal error events and we iterate to handle them
+                if (!this.internalQueue.isEmpty()) {
+                    continue
+                }
+
+                // A blocking wait for an external event.  Alternatively, if we have been invoked
+                // our parent session also might cancel us.  The mechanism for this is platform specific,
+                // but here we assume it’s a special event we receive
+                const externalEvent = await this.externalQueue.dequeue()
+                this.event = externalEvent
+
+                if (isCancelEvent(externalEvent)) {
+                    this.running = false
+                    continue
+                }
+                for (const state of Array.from(this.configuration)) {
+                    for (const inv of Array.from(state.invoke)) {
+                        if (inv.invokeid === externalEvent.invokeid) {
+                            this.applyFinalize(inv, externalEvent)
+                        }
+                        if (inv.autoforward) {
+                            this.send(externalEvent, inv.id)
+                        }
+                    }
+                }
+                enabledTransitions = this.selectTransitions(externalEvent)
+                if (!enabledTransitions.isEmpty()) {
+                    this.microstep(enabledTransitions.toList())
+                }
             }
         }
-        return targets
+        // End of outer while running loop.  If we get here, we have reached a top-level final state or have been cancelled
+        this.exitInterpreter()
     }
 
-    removeConflictingTransitions(
-        enabledTransitions: OrderedSet<TransitionRef>,
-    ) {
-        const filteredTransitions = new OrderedSet<TransitionRef>()
-        //toList sorts the transitions in the order of the states that selected them
-        for (const t1 of enabledTransitions.toList()) {
-            let t1Preempted = false
-            const transitionsToRemove = new OrderedSet<TransitionRef>()
-            for (const t2 of filteredTransitions.toList()) {
-                if (
-                    this.computeExitSet([t1]).hasIntersection(
-                        this.computeExitSet([t2]),
-                    )
-                ) {
-                    if (t1.source && isDescendant(t1.source, t2.source)) {
-                        transitionsToRemove.add(t2)
-                    } else {
-                        t1Preempted = true
-                        break
+    abstract invoke(inv: any): void
+
+    abstract applyFinalize(inv: InvokeNode, externalEvent: any): void
+
+    abstract send(externalEvent: any, to?: string): void
+
+    abstract executeContent(content: any): void
+
+    private exitInterpreter() {
+        const statesToExit = this.configuration.toList().sort(exitOrder)
+        for (const s of statesToExit) {
+            for (const content of s.onexit.sort(documentOrder)) {
+                this.executeContent(content)
+            }
+            for (const inv of s.invoke) {
+                this.cancelInvoke(inv)
+            }
+            this.configuration.delete(s)
+            if (isFinalState(s) && isSCXMLElement(s.parent)) {
+                this.returnDoneEvent(s.donedata)
+            }
+        }
+    }
+
+    protected constructor(private doc: StateDocument) {
+        this.running = true
+        this.configuration = new OrderedSet()
+        this.statesToInvoke = new OrderedSet()
+        this.internalQueue = new Queue()
+        this.externalQueue = new BlockingQueue()
+        this.historyValue = new HashTable()
+    }
+
+    start(datamodel: any = {}) {
+        this.datamodel = datamodel
+        this.enterStates(new List([this.doc.initial.transition]))
+        void this.mainEventLoop()
+    }
+
+    private selectEventlessTransitions(): OrderedSet<TransitionNode> {
+        let enabledTransitions = new OrderedSet<TransitionNode>()
+        const atomicStates = this.configuration.toList().filter(isAtomicState).sort(documentOrder)
+        for (const state of atomicStates) {
+            loop: for (const s of new List([state]).append(getProperAncestors(state, null))) {
+                for (const t of Array.from(s.transition.sort(documentOrder))) {
+                    if (!t.event.length && conditionMatch(t, this.datamodel, this.event)) {
+                        enabledTransitions.add(t)
+                        break loop
                     }
+                }
+            }
+        }
+        enabledTransitions = this.removeConflictingTransitions(enabledTransitions)
+        return enabledTransitions
+    }
+
+    private removeConflictingTransitions(enabledTransitions: OrderedSet<TransitionNode>): OrderedSet<TransitionNode> {
+        const filteredTransitions = new OrderedSet<TransitionNode>()
+        // toList sorts the transitions in the order of the states that selected them
+        for (const t1 of Array.from(enabledTransitions.toList())) {
+            let t1Preempted = false
+            const transitionsToRemove = new OrderedSet<TransitionNode>()
+            for (const t2 of Array.from(filteredTransitions.toList())) {
+                if (this.computeExitSet(new List([t1])).hasIntersection(this.computeExitSet(new List([t2])))) {
+                    if (isDescendant(t1.source, t2.source)) {
+                        transitionsToRemove.add(t2)
+                    }
+                }
+                else {
+                    t1Preempted = true
+                    break
                 }
             }
             if (!t1Preempted) {
-                for (const t3 of transitionsToRemove.toList()) {
+                for (const t3 of Array.from(transitionsToRemove.toList())) {
                     filteredTransitions.delete(t3)
                 }
                 filteredTransitions.add(t1)
@@ -280,13 +222,39 @@ export abstract class BaseInterpreter<T extends { [key: string]: any } = any> {
         return filteredTransitions
     }
 
-    computeExitSet(transitions: TransitionRef[]) {
-        const { configuration } = this
-        const statesToExit = new OrderedSet<StateRef>()
-        for (const t of transitions) {
-            if (t.target.length > 0) {
+    private selectTransitions(event: any): OrderedSet<TransitionNode> {
+        let enabledTransitions = new OrderedSet<TransitionNode>()
+        const atomicStates = this.configuration.toList().filter(isAtomicState).sort(documentOrder)
+        for (const state of atomicStates) {
+            loop: for (const s of Array.from(new List([state]).append(getProperAncestors(state, null)))) {
+                for (const t of Array.from(s.transition.sort(documentOrder))) {
+                    if (t.event && nameMatch(t.event, event.name) && conditionMatch(t, this.datamodel, this.event)) {
+                        enabledTransitions.add(t)
+                        break loop
+                    }
+                }
+            }
+        }
+        enabledTransitions = this.removeConflictingTransitions(enabledTransitions)
+        return enabledTransitions
+    }
+
+    private microstep(enabledTransitions: List<TransitionNode>) {
+        this.exitStates(enabledTransitions)
+        this.executeTransitionContent(enabledTransitions)
+        this.enterStates(enabledTransitions)
+    }
+
+    abstract cancelInvoke(inv: InvokeNode): void
+
+    abstract returnDoneEvent(donedata: any): void
+
+    private computeExitSet(transitions: List<TransitionNode>): OrderedSet<StateNode> {
+        const statesToExit = new OrderedSet<StateNode>()
+        for (const t of Array.from(transitions)) {
+            if (t.target.length) {
                 const domain = this.getTransitionDomain(t)
-                for (const s of configuration) {
+                for (const s of Array.from(this.configuration)) {
                     if (isDescendant(s, domain)) {
                         statesToExit.add(s)
                     }
@@ -296,251 +264,115 @@ export abstract class BaseInterpreter<T extends { [key: string]: any } = any> {
         return statesToExit
     }
 
-    selectEventlessTransitions() {
-        const { configuration, context } = this
-        const enabledTransitions = new OrderedSet<TransitionRef>()
-        const atomicStates = configuration
-            .toList()
-            .filter(isAtomicState)
-            .sort(documentOrder)
-
-        for (const state of atomicStates) {
-            loop: for (const s of [state].concat(
-                getProperAncestors(state, null),
-            )) {
-                for (const t of s.transitions.slice().sort(documentOrder)) {
-                    if (!t.event && conditionMatch(t, context)) {
-                        enabledTransitions.add(t)
-                        break loop
-                    }
-                }
-            }
-        }
-
-        return this.removeConflictingTransitions(enabledTransitions)
-    }
-
-    selectTransitions(event: { name: string }) {
-        const { configuration, context } = this
-        const enabledTransitions = new OrderedSet<TransitionRef>()
-        const atomicStates = configuration
-            .toList()
-            .filter(isAtomicState)
-            .sort(documentOrder)
-
-        for (const state of atomicStates) {
-            loop: for (const s of [state].concat(
-                getProperAncestors(state, null),
-            )) {
-                for (const t of s.transitions.slice().sort(documentOrder)) {
-                    if (
-                        t.event &&
-                        nameMatch(t.event, event.name) &&
-                        conditionMatch(t, context)
-                    ) {
-                        enabledTransitions.add(t)
-                        break loop
-                    }
-                }
-            }
-        }
-
-        return this.removeConflictingTransitions(enabledTransitions)
-    }
-
-    microstep(enabledTransitions: TransitionRef[]) {
-        this.exitStates(enabledTransitions)
-        this.executeTransitionContent(enabledTransitions)
-        this.enterStates(enabledTransitions)
-    }
-
-    exitStates(enabledTransitions: TransitionRef[]) {
-        const { configuration, statesToInvoke, historyValue } = this
-        const statesToExit = this.computeExitSet(enabledTransitions)
-        for (const s of statesToExit) {
-            statesToInvoke.delete(s)
-        }
-        const listOfStatesToExit = statesToExit.toList().sort(exitOrder)
-        for (const s of listOfStatesToExit) {
-            for (const h of s.history) {
-                const f =
-                    h.def.type === "deep"
-                        ? (s0: any) => isAtomicState(s0) && isDescendant(s0, s)
-                        : (s0: any) => s0.parent === s
-
-                historyValue[h.def.id] = configuration.toList().filter(f)
-            }
-            for (const _s of listOfStatesToExit) {
-                this.executeContent(_s.onexit)
-                for (const inv of _s.invoke) {
-                    this.cancelInvoke(inv)
-                }
-                configuration.delete(_s)
-            }
-        }
-    }
-
-    executeTransitionContent(enabledTransitions: TransitionRef[]) {
+    private executeTransitionContent(enabledTransitions: List<TransitionNode>) {
         for (const t of enabledTransitions) {
-            this.executeContent(t)
+            this.executeContent(t.content)
         }
     }
 
-    async mainEventLoop() {
-        const {
-            datamodel,
-            internalQueue,
-            externalQueue,
-            configuration,
-            statesToInvoke,
-        } = this
-        while (this.running) {
-            let enabledTransitions = null
-            let macrostepDone = false
-
-            while (this.running && !macrostepDone) {
-                enabledTransitions = this.selectEventlessTransitions()
-                if (enabledTransitions.isEmpty()) {
-                    if (internalQueue.isEmpty()) {
-                        macrostepDone = true
-                    } else {
-                        const internalEvent = internalQueue.dequeue()
-                        datamodel["_event"] = internalEvent
-                        enabledTransitions = this.selectTransitions(
-                            internalEvent,
-                        )
-                    }
-                }
-                if (!enabledTransitions.isEmpty()) {
-                    this.microstep(enabledTransitions.toList())
-                }
-            }
-            console.log(
-                "current state:",
-                configuration
-                    .toList()
-                    .sort(exitOrder)
-                    .map(s => s.id)
-                    .filter(Boolean)
-                    .join(", "),
-            )
-
-            // either we're in a final state, and we break out of the loop
-            if (!this.running) {
-                break
-            }
-            // or we've completed a macrostep, so we start a new macrostep by waiting for an external event
-            // Here we invoke whatever needs to be invoked. The implementation of 'invoke' is platform-specific
-            for (const state of statesToInvoke.toList().sort(entryOrder)) {
-                for (const inv of state.invoke.sort(documentOrder)) {
-                    this.invoke(inv)
-                }
-            }
-            statesToInvoke.clear()
-            // Invoking may have raised internal error events and we iterate to handle them
-            if (!internalQueue.isEmpty()) {
-                continue
-            }
-            // A blocking wait for an external event. Alternatively, if we have been invoked
-            // our parent session also might cancel us. The mechanism for this is platform specific,
-            // but here we assume it’s a special event we receive
-            const externalEvent: ScxmlEvent = await externalQueue.dequeue()
-            if (isCancelEvent(externalEvent)) {
-                this.running = false
-                continue
-            }
-            datamodel._event = externalEvent
-            for (const state of configuration) {
-                for (const inv of state.invoke) {
-                    if (inv.id === externalEvent.invokeid) {
-                        this.applyFinalize(inv, externalEvent)
-                    }
-                    if (inv.autoforward || inv.id === externalEvent.target) {
-                        this.send(externalEvent, inv.id)
-                    }
-                }
-            }
-            enabledTransitions = this.selectTransitions(externalEvent)
-            if (!enabledTransitions.isEmpty()) {
-                this.microstep(enabledTransitions.toList())
-            }
-            // this.tick.next(this.datamodel)
+    private exitStates(enabledTransitions: List<TransitionNode>) {
+        let statesToExit: OrderedSet<StateNode> | StateNode[] = this.computeExitSet(enabledTransitions)
+        for (const s of Array.from(statesToExit)) {
+            this.statesToInvoke.delete(s)
         }
-        // End of outer while running loop. If we get here, we have reached a top-level final state or have been cancelled
-        this.exitInterpreter()
-    }
-
-    exitInterpreter() {
-        const { configuration } = this
-        console.log(
-            "final state:",
-            configuration
-                .toList()
-                .sort(exitOrder)
-                .filter(Boolean)
-                .map(s => s.id)
-                .join(", "),
-        )
-        const statesToExit = configuration.toList().sort(exitOrder)
+        statesToExit = statesToExit.toList().sort(exitOrder)
         for (const s of statesToExit) {
-            this.executeContent(s.onexit)
-            for (const inv of s.invoke) {
+            for (const h of Array.from(s.history)) {
+                let f
+                if (h.type === "deep") {
+                    f = (s0: any) => isAtomicState(s0) && isDescendant(s0,s)
+                } else {
+                    f = (s0: any) => s0.parent === s
+                }
+                this.historyValue[h.id] = this.configuration.toList().filter(f)
+            }
+        }
+        for (const s of Array.from(statesToExit)) {
+            for (const content of s.onexit.sort(documentOrder)) {
+                this.executeContent(content)
+            }
+            for (const inv of Array.from(s.invoke)) {
                 this.cancelInvoke(inv)
             }
-            configuration.delete(s)
-            if (isFinalState(s) && isSCXMLElement(s.parent)) {
-                this.returnDoneEvent(s.donedata)
+            this.configuration.delete(s)
+        }
+    }
+
+    private getTransitionDomain(t: TransitionNode): StateNode | null {
+        const tstates = this.getEffectiveTargetStates(t)
+        if (!tstates) {
+            return null
+        }
+        else if (t.type === "internal" && isCompoundState(t.source) && tstates.every(s => isDescendant(s, t.source))) {
+            return t.source
+        }
+        else {
+            return this.findLCCA(new List([t.source]).append(tstates.toList()))
+        }
+    }
+
+    private computeEntrySet(transitions: List<TransitionNode>, statesToEnter: OrderedSet<StateNode>, statesForDefaultEntry: OrderedSet<StateNode>, defaultHistoryContent: HashTable<StateNode[]>) {
+        for (const t of Array.from(transitions)) {
+            for (const s of t.target) {
+                this.addDescendantStatesToEnter(s,statesToEnter,statesForDefaultEntry, defaultHistoryContent)
+            }
+            const ancestor = this.getTransitionDomain(t)
+            for (const s of Array.from(this.getEffectiveTargetStates(t))) {
+                this.addAncestorStatesToEnter(s, ancestor, statesToEnter, statesForDefaultEntry, defaultHistoryContent)
             }
         }
     }
 
-    enterStates(enabledTransitions: TransitionRef[]) {
-        const { configuration, statesToInvoke } = this
-        const statesToEnter = new OrderedSet<StateRef>()
-        const statesForDefaultEntry = new OrderedSet<StateRef>()
-        const defaultHistoryContent: HistoryContent = {}
+    private isInFinalState(s: StateNode): boolean {
+        if (isCompoundState(s)) {
+            return getChildStates(s).some(_s => isFinalState(_s) && this.configuration.isMember(_s))
+        }
+        else if (isParallelState(s)) {
+            return getChildStates(s).every(this.isInFinalState, this)
+        }
+        else {
+            return false
+        }
+    }
 
-        this.computeEntrySet(
-            enabledTransitions,
-            statesToEnter,
-            statesForDefaultEntry,
-            defaultHistoryContent,
-        )
-
-        for (const s of statesToEnter.toList().sort(entryOrder)) {
-            configuration.add(s)
-            statesToInvoke.add(s)
-            if (this.binding === "late" && s.firstEntry) {
-                this.datamodel.initialize()
-                s.firstEntry = false
+    private addDescendantStatesToEnter(state: StateNode, statesToEnter: OrderedSet<StateNode>, statesForDefaultEntry: OrderedSet<StateNode>, defaultHistoryContent: HashTable<StateNode[]>) {
+        if (isHistoryState(state)) {
+            if (this.historyValue[state.id]) {
+                for (const s of this.historyValue[state.id]) {
+                    this.addDescendantStatesToEnter(s,statesToEnter,statesForDefaultEntry, defaultHistoryContent)
+                }
+                for (const s of this.historyValue[state.id]) {
+                    this.addAncestorStatesToEnter(s, state.parent, statesToEnter, statesForDefaultEntry, defaultHistoryContent)
+                }
+            } else {
+                const transition = state.transition.toList().head()
+                defaultHistoryContent[state.parent.id] = transition.content
+                for (const s of transition.target) {
+                    this.addDescendantStatesToEnter(s,statesToEnter,statesForDefaultEntry, defaultHistoryContent)
+                }
+                for (const s of transition.target) {
+                    this.addAncestorStatesToEnter(s, state.parent, statesToEnter, statesForDefaultEntry, defaultHistoryContent)
+                }
             }
-            this.executeContent(s.onentry)
-            if (statesForDefaultEntry.has(s)) {
-                this.executeContent(s.initial.transition)
+        }
+        else {
+            statesToEnter.add(state)
+            if (isCompoundState(state)) {
+                statesForDefaultEntry.add(state)
+                // tslint:disable-next-line:no-non-null-assertion
+                for (const s of state.initial!.transition.target) {
+                    this.addDescendantStatesToEnter(s,statesToEnter,statesForDefaultEntry, defaultHistoryContent)
+                }
+                // tslint:disable-next-line:no-non-null-assertion
+                for (const s of state.initial!.transition.target) {
+                    this.addAncestorStatesToEnter(s, state, statesToEnter, statesForDefaultEntry, defaultHistoryContent)
+                }
             }
-            if (isFinalState(s)) {
-                if (isSCXMLElement(s.parent)) {
-                    this.running = false
-                } else {
-                    const parent = s.parent
-                    if (parent) {
-                        const grandparent = parent.parent
-                        const event: ScxmlEvent = {
-                            ...s.donedata,
-                            name: "done.state." + parent.id,
-                        }
-                        this.internalQueue.enqueue(event)
-                        if (grandparent && isParallelState(grandparent)) {
-                            if (
-                                getChildStates(grandparent).every(
-                                    this.isInFinalState,
-                                    this,
-                                )
-                            ) {
-                                this.internalQueue.enqueue(
-                                    new Event("done.state." + grandparent.id),
-                                )
-                            }
+            else {
+                if (isParallelState(state)) {
+                    for (const child of getChildStates(state)) {
+                        if (!statesToEnter.some(s => isDescendant(s, child))) {
+                            this.addDescendantStatesToEnter(child,statesToEnter,statesForDefaultEntry, defaultHistoryContent)
                         }
                     }
                 }
@@ -548,15 +380,42 @@ export abstract class BaseInterpreter<T extends { [key: string]: any } = any> {
         }
     }
 
-    abstract invoke(inv: InvokeRef)
+    private addAncestorStatesToEnter(state: StateNode, ancestor: StateNode | null, statesToEnter: OrderedSet<StateNode>, statesForDefaultEntry: OrderedSet<StateNode>, defaultHistoryContent: HashTable<StateNode[]>) {
+        for (const anc of Array.from(getProperAncestors(state, ancestor))) {
+            statesToEnter.add(anc)
+            if (isParallelState(anc)) {
+                for (const child of getChildStates(anc)) {
+                    if (!statesToEnter.some(s => isDescendant(s, child))) {
+                        this.addDescendantStatesToEnter(child,statesToEnter,statesForDefaultEntry, defaultHistoryContent)
+                    }
+                }
+            }
+        }
+    }
 
-    abstract executeContent(content: any)
+    private getEffectiveTargetStates(transition: TransitionNode): OrderedSet<StateNode> {
+        const targets = new OrderedSet<StateNode>()
+        for (const s of transition.target) {
+            if (isHistoryState(s)) {
+                if (this.historyValue[s.id]) {
+                    targets.union(new OrderedSet(this.historyValue[s.id]))
+                } else {
+                    targets.union(this.getEffectiveTargetStates(s.transition.toList().head()))
+                }
+            } else {
+                targets.add(s)
+            }
+        }
+        return targets
+    }
 
-    abstract cancelInvoke(inv: any)
-
-    abstract returnDoneEvent(donedata: any)
-
-    abstract send(event: any, target?: string)
-
-    abstract applyFinalize(inv: any, externalEvent: any)
+    private findLCCA(stateList: List<StateNode>) {
+        const ancestors = getProperAncestors(stateList.head(), null).filter(isCompoundStateOrScxmlElement)
+        for (const anc of ancestors) {
+            if (stateList.tail().every(s => isDescendant(s, anc))) {
+                return anc
+            }
+        }
+        throw new Error(`Could not find LCCA`)
+    }
 }

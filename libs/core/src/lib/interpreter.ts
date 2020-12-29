@@ -1,145 +1,128 @@
-import {BaseInterpreter} from "./base-interpreter";
-import {CommandType} from "./schemas";
-import {ExecutableRef, InvokeRef} from "./models";
+import { BaseInterpreter } from "./base-interpreter"
+import { InvokeNode, StateDocument } from "./interfaces"
+import { ContentSchema, expandSchema, RootMetadata, state, target, TransitionSchema } from "./schema"
+import { CANCEL, hasLegalCompletion } from "./utils"
 
 export class Interpreter extends BaseInterpreter {
-    callbacks = new Map();
-    srcMap = {};
+    id: string
+    datamodel: any;
+    invokeMap: Map<string, any>
 
-    on(event, callback) {
-        (
-            this.callbacks.get(event) || this.callbacks.set(event, []).get(event)
-        ).push(callback);
+    get state() {
+        return Array.from(this.configuration, v => v.id)
     }
 
-    executeContent(content: ExecutableRef) {
-        const { datamodel, context } = this;
-        if (!content) {
-            return;
+    applyFinalize(inv: InvokeNode, externalEvent: any): void {
+        const invoke = this.invokeMap.get(inv.id)
+        if (invoke.src instanceof BaseInterpreter) {
+            invoke.src.event = externalEvent
+            invoke.src.executeContent(inv.content)
         }
-        function createProxy(value, path) {
-            return new Proxy(value, {
-                get(target: any, p: string | number | symbol, receiver: any): any {
-                    const _value = target[p];
-                    path.push(p);
-                    return typeof _value === "object" && _value !== null
-                        ? createProxy(target[p], path)
-                        : _value;
-                }
-            });
-        }
-        function getPath(fn, value) {
-            const path = [];
-            const proxy = createProxy(value, path);
-            fn(proxy);
-            return path;
-        }
-        function resolve(path, obj) {
-            return path.reduce((next, key) => next[key], obj);
-        }
-        function setValue(path, obj, value) {
-            const target = resolve(path.slice(0, -1), obj);
-            target[path[path.length - 1]] = value;
-        }
+    }
 
-        for (const command of content.commands) {
-            const def = command.def;
-            switch (def.command) {
-                case CommandType.assign: {
-                    const path = getPath(def.location, datamodel.data);
-                    const value = resolve(path, datamodel.data);
-                    const nextValue =
-                        typeof def.expr === "function"
-                            ? def.expr(value, datamodel._event)
-                            : def.expr;
-                    setValue(path, datamodel.data, nextValue);
-                    break;
+    executeContent(contents: ContentSchema[] = []): void {
+        for (const content of contents) {
+            switch(content.type) {
+                case "send": {
+                    this.send(content.payload)
+                    break
                 }
-                case CommandType.send: {
-                    this.send(
-                        {
-                            name: def.event,
-                            origin: def.id,
-                            type: def.type,
-                            data: def.content,
-                            delay: def.delay
-                        },
-                        def.target
-                    );
-                    break;
+                case "raise": {
+                    this.raise(content.payload)
+                    break
                 }
-                case CommandType.raise: {
-                    this.send({
-                        event: def.event,
-                        target: "_internal"
-                    });
-                    break;
+                case "assign": {
+                    this.assign(content.payload)
+                    break
                 }
-                case CommandType.script: {
-                    context[def.src](datamodel.data, datamodel._event);
-                    break;
-                }
-                default: {
-                    throw new Error(`unknown command: ${JSON.stringify(command.def)}`);
+                case "log": {
+                    this.log(content.payload)
                 }
             }
         }
     }
 
-    cancelInvoke(inv: InvokeRef) {
-        const instance = this.invokes[inv.id];
-        if (instance instanceof BaseInterpreter) {
-            instance.exitInterpreter();
+    log(message?: string) {
+        if (message) {
+            console.log(`log: ${message}`)
+        }
+        console.log("event:", this.event)
+        console.log("datamodel:", this.datamodel)
+    }
+
+    assign(reducers: ((datamodel: any, event: any) => any)[] = []) {
+        for (const reduce of reducers) {
+            reduce(this.datamodel, this.event)
         }
     }
 
-    returnDoneEvent(donedata: any) {
-        const callbacks = this.callbacks.get("done");
-        if (callbacks) {
-            callbacks.forEach(callback => callback(donedata));
+    invoke(inv: InvokeNode): void {
+        if (inv.src instanceof BaseInterpreter) {
+            this.invokeMap.set(inv.id, inv)
+            inv.src.id = inv.id
+            inv.src.parent = this
+            inv.src.start()
         }
     }
 
-    send(event: any, target?: string) {
-        if (target === "_internal") {
-            console.log("raise: " + event.name);
-            this.internalQueue.enqueue(event);
-        } else if (target === "_parent" && this.parent) {
-            console.log("parent");
-            this.parent.send(event);
-        } else if (target) {
-            const invoke: Interpreter = this.invokes[target];
-            invoke.send({
-                name: event.name,
-                data: event.data,
-                origin: this
-            });
+    cancelInvoke(inv: InvokeNode): void {
+        const invoke = this.invokeMap.get(inv.id)
+        if (invoke.src instanceof BaseInterpreter) {
+            invoke.src.send(CANCEL)
+        }
+    }
+
+    returnDoneEvent(donedata: any): void {
+        if (this.parent) {
+            this.parent.send({
+                name: `done.invoke.${this.id}`,
+                invokeid: this.id
+            })
+        }
+    }
+
+    raise(event: any) {
+        this.internalQueue.enqueue(event)
+    }
+
+    send(externalEvent: any, to: string = externalEvent.target): void {
+        if (!to || to === "_self" || to === this.id) {
+            this.externalQueue.enqueue(externalEvent)
         } else {
-            console.log("send: " + event.name);
-            this.externalQueue.enqueue(event);
-        }
-    }
-
-    applyFinalize(inv: any, externalEvent: any) {
-        // not implemented
-    }
-
-    invoke(inv: InvokeRef) {
-        const { invokes } = this;
-
-        if (!inv.type) {
-            if (invokes[inv.id]) {
-                throw new Error(`Already invoked "${inv.id}"`);
+            if (to === "_parent" && this.parent) {
+                this.parent.send(externalEvent, "_self")
+            } else {
+                const child = this.invokeMap.get(to)
+                if (child.src instanceof Interpreter) {
+                    child.src.send(externalEvent)
+                }
             }
-            const child = new Interpreter(
-                typeof inv.src === "string" ? this.srcMap[inv.src] : inv.src,
-                this
-            );
-            invokes[inv.id] = child;
-
-            child.on("done", () => {
-                this.send(`done.invoke.${inv.id}`);
-            });
         }
+    }
+
+    constructor(doc: RootMetadata = []) {
+        const root = state("$$root", doc)
+        const states = new Map()
+        const transitions = new Set<TransitionSchema>()
+        expandSchema(doc, root, states, transitions)
+        root.ancestors = [root]
+        root.parent = root
+        for (const element of Array.from(transitions)) {
+            element.target = element[target].map((t) => states.get(t)).filter(s => s !== undefined)
+        }
+        super(root as StateDocument)
+
+        for (const element of Array.from(transitions)) {
+            if (!hasLegalCompletion(element.target)) {
+                throw new Error(`Invalid transition target`)
+            }
+        }
+
+        this.datamodel = {
+            event: undefined,
+            state: {}
+        }
+        this.invokeMap = new Map()
+        this.id = ""
     }
 }
